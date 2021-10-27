@@ -5,10 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"gee-rpc/src/codec/codec"
-	geerpc "gee-rpc/src/service"
+	service "gee-rpc/src/service"
 	"io"
 	"log"
 	"net"
+	"net/http"
 	"reflect"
 	"strings"
 	"sync"
@@ -16,6 +17,12 @@ import (
 )
 
 const MagicNumber = 0x3bef5c
+
+const (
+	Connected        = "200 Connected to Gee RPC"
+	DefaultRPCPath   = "/_geerpc_"
+	DefaultDebugPath = "/debug/geerpc"
+)
 
 type Option struct {
 	MagicNumber    int
@@ -32,7 +39,7 @@ var DefaultOption = &Option{
 
 // Server represents an RPC Server
 type Server struct {
-	serviceMap sync.Map
+	ServiceMap sync.Map
 }
 
 // NewServer returns a new Server
@@ -84,8 +91,8 @@ func (server *Server) ServeConn(conn io.ReadWriteCloser) {
 
 // Register publishes in the server the set of methods of the
 func (server *Server) Register(rcvr interface{}) error {
-	s := geerpc.NewService(rcvr)
-	if _, dup := server.serviceMap.LoadOrStore(s.Name, s); dup {
+	s := service.NewService(rcvr)
+	if _, dup := server.ServiceMap.LoadOrStore(s.Name, s); dup {
 		return errors.New("rpc: service already defined: " + s.Name)
 	}
 	return nil
@@ -94,7 +101,7 @@ func (server *Server) Register(rcvr interface{}) error {
 // Register publishes the receiver's methods in the DefaultServer.
 func Register(rcvr interface{}) error { return DefaultServer.Register(rcvr) }
 
-func (server *Server) findService(serviceMethod string) (svc *geerpc.Service, mtype *geerpc.MethodType, err error) {
+func (server *Server) findService(serviceMethod string) (svc *service.Service, mtype *service.MethodType, err error) {
 	dot := strings.LastIndex(serviceMethod, ".")
 	if dot < 0 {
 		err = errors.New("rpc server: service/method request ill-formed: " + serviceMethod)
@@ -102,13 +109,13 @@ func (server *Server) findService(serviceMethod string) (svc *geerpc.Service, mt
 	}
 
 	serviceName, methodName := serviceMethod[:dot], serviceMethod[dot+1:]
-	svci, ok := server.serviceMap.Load(serviceName)
+	svci, ok := server.ServiceMap.Load(serviceName)
 	if !ok {
 		err = errors.New("rpc server: can't find service " + serviceName)
 		return
 	}
 
-	svc = svci.(*geerpc.Service)
+	svc = svci.(*service.Service)
 	mtype = svc.Method[methodName]
 	if mtype == nil {
 		err = errors.New("rpc server: can't find method " + methodName)
@@ -133,7 +140,7 @@ func (server *Server) serveCodec(cc codec.Codec) {
 			continue
 		}
 		wg.Add(1)
-		go server.handleRequest(cc, req, sending, wg,10)
+		go server.handleRequest(cc, req, sending, wg, 10)
 	}
 	wg.Wait()
 	_ = cc.Close()
@@ -143,8 +150,8 @@ func (server *Server) serveCodec(cc codec.Codec) {
 type request struct {
 	h            *codec.Header // header of request
 	argv, replyv reflect.Value // argv and replyv of request
-	mtype        *geerpc.MethodType
-	svc          *geerpc.Service
+	mtype        *service.MethodType
+	svc          *service.Service
 }
 
 func (server *Server) readRequestHeader(cc codec.Codec) (*codec.Header, error) {
@@ -222,4 +229,36 @@ func (server *Server) handleRequest(cc codec.Codec, req *request, sending *sync.
 	case <-called:
 		<-sent
 	}
+}
+
+// ServeHTTP implements an http.Handler that answer RPC requests.
+func (server *Server) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "CONNECT" {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		_, _ = io.WriteString(w, "405 must CONNECT\n")
+		return
+	}
+
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		log.Print("rpc hijacking ", req.RemoteAddr, ": ", err.Error())
+		return
+	}
+
+	_, _ = io.WriteString(conn, "HTTP/1.0 "+Connected+"\n\n")
+	server.ServeConn(conn)
+}
+
+// HandleHTTP registers an HTTP handler for RPC Messages on rpcPath.
+// It is still necessary to invoke http.Serve(), typically in a go statement
+func (server *Server) HandleHTTP() {
+	http.Handle(DefaultRPCPath, server)
+	http.Handle(DefaultDebugPath, DebugHTTP{server})
+	log.Println("rpc server debug path:", DefaultDebugPath)
+}
+
+// HandleHTTP is a convenient approach for default server to register HTTP handlers
+func HandleHTTP() {
+	DefaultServer.HandleHTTP()
 }

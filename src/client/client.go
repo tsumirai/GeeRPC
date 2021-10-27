@@ -1,15 +1,18 @@
 package geerpc
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"gee-rpc/src/codec/codec"
-	geerpc "gee-rpc/src/server"
+	server "gee-rpc/src/server"
 	"io"
 	"log"
 	"net"
+	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -34,7 +37,7 @@ func (call *Call) done() {
 // multiple goroutines simultaneously
 type Client struct {
 	cc       codec.Codec
-	opt      *geerpc.Option
+	opt      *server.Option
 	sending  sync.Mutex // protect following
 	header   codec.Header
 	mu       sync.Mutex // protect following
@@ -133,7 +136,7 @@ func (client *Client) receive() {
 	client.terminateCalls(err)
 }
 
-func NewClient(conn net.Conn, opt *geerpc.Option) (*Client, error) {
+func NewClient(conn net.Conn, opt *server.Option) (*Client, error) {
 	f := codec.NewCodecFuncMap[opt.CodecType]
 	if f == nil {
 		err := fmt.Errorf("invalid codec type %s", opt.CodecType)
@@ -151,7 +154,7 @@ func NewClient(conn net.Conn, opt *geerpc.Option) (*Client, error) {
 	return newClientCodec(f(conn), opt), nil
 }
 
-func newClientCodec(cc codec.Codec, opt *geerpc.Option) *Client {
+func newClientCodec(cc codec.Codec, opt *server.Option) *Client {
 	client := &Client{
 		seq:     1, // seq starts with 1, 0 means invalid call
 		cc:      cc,
@@ -162,10 +165,10 @@ func newClientCodec(cc codec.Codec, opt *geerpc.Option) *Client {
 	return client
 }
 
-func ParseOptions(opts ...*geerpc.Option) (*geerpc.Option, error) {
+func ParseOptions(opts ...*server.Option) (*server.Option, error) {
 	// if opts is nil or pass nil as parameter
 	if len(opts) == 0 || opts[0] == nil {
-		return geerpc.DefaultOption, nil
+		return server.DefaultOption, nil
 	}
 
 	if len(opts) != 1 {
@@ -173,15 +176,15 @@ func ParseOptions(opts ...*geerpc.Option) (*geerpc.Option, error) {
 	}
 
 	opt := opts[0]
-	opt.MagicNumber = geerpc.DefaultOption.MagicNumber
+	opt.MagicNumber = server.DefaultOption.MagicNumber
 	if opt.CodecType == "" {
-		opt.CodecType = geerpc.DefaultOption.CodecType
+		opt.CodecType = server.DefaultOption.CodecType
 	}
 	return opt, nil
 }
 
 // Dial connects to an RPC server at the specified network address
-func Dial(network, address string, opts ...*geerpc.Option) (client *Client, err error) {
+func Dial(network, address string, opts ...*server.Option) (client *Client, err error) {
 	return dialTimeout(NewClient, network, address, opts...)
 }
 
@@ -251,9 +254,9 @@ type clientResult struct {
 	err    error
 }
 
-type newClientFunc func(conn net.Conn, opt *geerpc.Option) (client *Client, err error)
+type newClientFunc func(conn net.Conn, opt *server.Option) (client *Client, err error)
 
-func dialTimeout(f newClientFunc, network, address string, opts ...*geerpc.Option) (client *Client, err error) {
+func dialTimeout(f newClientFunc, network, address string, opts ...*server.Option) (client *Client, err error) {
 	opt, err := ParseOptions()
 	if err != nil {
 		return nil, err
@@ -284,5 +287,47 @@ func dialTimeout(f newClientFunc, network, address string, opts ...*geerpc.Optio
 		return nil, fmt.Errorf("rpc client: connect timeout: expect within %s", opt.ConnectTimeout)
 	case result := <-ch:
 		return result.client, result.err
+	}
+}
+
+// NewHTTPClient new a Client instance via HTTP as transport protocol
+func NewHTTPClient(conn net.Conn, opt *server.Option) (*Client, error) {
+	_, _ = io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.0]n\n", server.DefaultRPCPath))
+
+	// Require successful HTTP response
+	// before switching to RPC protocol
+	resp, err := http.ReadResponse(bufio.NewReader(conn), &http.Request{Method: "CONNECT"})
+	if err == nil && resp.Status == server.Connected {
+		return NewClient(conn, opt)
+	}
+	if err == nil {
+		err = errors.New("unexpected HTTP response: " + resp.Status)
+	}
+	return nil, err
+}
+
+// DialHTTP connects to an HTTP RPC server at the specified network address
+// Listening on the default HTTP RPC path.
+func DialHTTP(network, address string, opts ...*server.Option) (*Client, error) {
+	return dialTimeout(NewHTTPClient, network, address, opts...)
+}
+
+// XDial calls different functions to connect to a RPC server
+// according the first parameter rpcAddr.
+// rpcAddr is a general format (protocol@addr) to represent a rpc server
+// eg, http@10.0.0.1.7001, tcp@10.0.0.1:1999, unix@/tmp/geerpc.sock
+func XDial(rpcAddr string, opts ...*server.Option) (*Client, error) {
+	parts := strings.Split(rpcAddr, "@")
+	if len(parts) != 2 {
+		return nil, fmt.Errorf("rpc client err: wrong format '%s', expect protocol@addr", rpcAddr)
+	}
+
+	protocol, addr := parts[0], parts[1]
+	switch protocol {
+	case "http":
+		return DialHTTP("tcp", addr, opts...)
+	default:
+		// tcp, unix or other transport protocol
+		return Dial(protocol, addr, opts...)
 	}
 }
